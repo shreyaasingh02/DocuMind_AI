@@ -11,7 +11,7 @@ import pdfParse from "pdf-parse";
 
 dotenv.config();
 
-const key = process.env.GEMINI_API_KEY;
+const key = process.env.GEMINI_API_KEY?.trim();
 
 console.log("Gemini key loaded:", Boolean(key));
 console.log("Gemini key length:", key?.trim().length);
