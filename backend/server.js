@@ -11,6 +11,11 @@ import pdfParse from "pdf-parse";
 
 dotenv.config();
 
+const key = process.env.GEMINI_API_KEY;
+
+console.log("Gemini key loaded:", Boolean(key));
+console.log("Gemini key length:", key?.trim().length);
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
