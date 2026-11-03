@@ -2,8 +2,12 @@ import express from "express";
 import cors from "cors";
 import multer from "multer";
 import dotenv from "dotenv";
-import pdfParse from "pdf-parse";
+
 import { randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+import pdfParse from "pdf-parse";
 
 dotenv.config();
 
