@@ -66,6 +66,114 @@ function App() {
     }
   }
 
+
+  async function streamSummary() {
+    setError("");
+
+    setResult({
+      type: "summary",
+      mode: "ai",
+      summary: "",
+      streaming: true
+    });
+
+    const response = await fetch(
+      `${API}/api/documents/${document.id}/summarize`,
+      { method: "POST" }
+    );
+
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error || "Could not generate the summary.");
+    }
+
+    if (!response.body) {
+      throw new Error("Your browser does not support streaming.");
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+
+    let buffer = "";
+    let completed = false;
+
+    function processEvent(block) {
+      let event = "message";
+      let dataText = "";
+
+      for (const line of block.split(/\r?\n/)) {
+        if (line.startsWith("event:")) {
+          event = line.slice(6).trim();
+        } else if (line.startsWith("data:")) {
+          dataText += line.slice(5).trim();
+        }
+      }
+
+      if (!dataText) return;
+
+      const data = JSON.parse(dataText);
+
+      if (event === "progress") {
+        setResult(prev => ({
+          ...prev,
+          progressMessage: data.message
+        }));
+      }
+
+      if (event === "delta") {
+        setResult(prev => ({
+          ...prev,
+          summary: prev.summary + data.text
+        }));
+      }
+
+      if (event === "done") {
+        completed = true;
+
+        setResult(prev => ({
+          ...prev,
+          mode: data.mode,
+          streaming: false
+        }));
+      }
+
+      if (event === "error") {
+        throw new Error(data.message || "Summary generation failed.");
+      }
+    }
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        const blocks = buffer.split(/\r?\n\r?\n/);
+        buffer = blocks.pop() || "";
+
+        for (const block of blocks) {
+          processEvent(block);
+        }
+      }
+
+      buffer += decoder.decode();
+
+      if (buffer.trim()) {
+        processEvent(buffer);
+      }
+
+      if (!completed) {
+        throw new Error("The summary stream ended unexpectedly.");
+      }
+
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+
   async function runAction(action, body = {}) {
     if (!document?.id) {
       setError("Upload a PDF first to use the AI tools.");
@@ -73,6 +181,10 @@ function App() {
     }
     setError(""); setBusy(action); setActiveTab(action === "quiz" ? "quiz" : action === "ask" ? "chat" : "summary");
     try {
+      if (action === "summary") {
+        await streamSummary();
+        return;
+      }
       const data = await apiRequest(`/api/documents/${document.id}/${action === "selection" ? "summarize-selection" : action === "summary" ? "summarize" : action}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -345,6 +457,7 @@ function App() {
                   <button className="secondary-btn copy-btn" onClick={copyResult}>{copied ? <Check size={15} /> : <Copy size={15} />}{copied ? "Copied" : "Copy"}</button>
                 </div>
                 {result.mode !== "ai" && <div className="demo-note">Preview mode: add a Gemini API key to enable real AI-generated results.</div>}
+
                 {result.summary && (
                   <div className="result-text markdown-content">
                     <ReactMarkdown remarkPlugins={[remarkGfm]}>
@@ -352,6 +465,19 @@ function App() {
                     </ReactMarkdown>
                   </div>
                 )}
+
+
+                {result.streaming && (
+                  <div className="stream-status">
+                    <LoaderCircle size={16} className="spin" />
+
+                    <span>
+                      {result.progressMessage || "Preparing your summary..."}
+                    </span>
+                  </div>
+                )}
+
+
                 {result.questions && <div className="questions-list">{result.questions.map((q, i) => <article className="question-item" key={i}><span className="question-number">{String(i + 1).padStart(2, "0")}</span><div className="question-body"><strong>{q.question}</strong>{q.options && <ul className="options-list">{q.options.map((o, j) => <li key={j}>{o}</li>)}</ul>}<details><summary>Show answer & explanation <ChevronDown size={14} /></summary><p><strong>Answer:</strong> {q.answer}</p>{q.explanation && <p><strong>Why:</strong> {q.explanation}</p>}</details></div></article>)}</div>}
               </section>
             )}

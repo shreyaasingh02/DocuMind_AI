@@ -18,7 +18,7 @@ console.log("Gemini key length:", key?.trim().length);
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 25 * 1024 * 1024 },
@@ -54,7 +54,7 @@ app.use(express.json({ limit: "2mb" }));
 // Prototype-only in-memory sessions. Restarting the server clears uploaded documents.
 const documents = new Map();
 
-function chunkText(text, maxChars = 14000) {
+function chunkText(text, maxChars = 28000) {
   const paragraphs = text.split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
   const chunks = [];
   let current = "";
@@ -83,6 +83,108 @@ function configuredModels() {
     .split(",").map(x => x.trim()).filter(Boolean);
   return [...new Set([primary, ...fallback])];
 }
+
+
+async function streamGeminiText(prompt, onText, options = {}) {
+  const key = process.env.GEMINI_API_KEY?.trim();
+  if (!key) throw new Error("Gemini API key is missing.");
+
+  let lastError;
+
+  for (const model of configuredModels()) {
+    let generatedAnyText = false;
+
+    try {
+      const endpoint =
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${encodeURIComponent(key)}`;
+
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            { role: "user", parts: [{ text: prompt }] }
+          ],
+          generationConfig: {
+            maxOutputTokens: options.maxOutputTokens || 1200
+          }
+        }),
+        signal: AbortSignal.timeout(120000)
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(
+          errorData?.error?.message || `Gemini HTTP ${response.status}`
+        );
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      async function processLine(line) {
+        const trimmed = line.trim();
+
+        if (!trimmed.startsWith("data:")) return;
+
+        const payload = trimmed.slice(5).trim();
+        if (!payload || payload === "[DONE]") return;
+
+        const data = JSON.parse(payload);
+
+        const text = data?.candidates?.[0]?.content?.parts
+          ?.map(part => part.text || "")
+          .join("") || "";
+
+        if (text) {
+          generatedAnyText = true;
+          await onText(text);
+        }
+      }
+
+      while (true) {
+        const { value, done } = await reader.read();
+
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          await processLine(line);
+        }
+      }
+
+      buffer += decoder.decode();
+
+      if (buffer.trim()) {
+        await processLine(buffer);
+      }
+
+      if (!generatedAnyText) {
+        throw new Error(`${model}: Gemini returned an empty response.`);
+      }
+
+      return;
+
+    } catch (error) {
+      lastError = error;
+
+      // Do not switch models after some text has already been sent.
+      if (generatedAnyText) throw error;
+
+      console.warn(`${model} streaming failed: ${error.message}`);
+    }
+  }
+
+  throw new Error(
+    `All Gemini streaming models failed: ${lastError?.message || "Unknown error"}`
+  );
+}
+
 
 async function askGemini(prompt, options = {}) {
   const key = process.env.GEMINI_API_KEY;
@@ -221,168 +323,179 @@ app.post("/api/documents/:id/summarize-selection", async (req, res) => {
 });
 
 
+
+
 app.post("/api/documents/:id/summarize", async (req, res) => {
   const doc = requireDocument(req, res);
   if (!doc) return;
 
+  const sendEvent = (event, data) => {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
   try {
-    const chunks = chunkText(doc.text);
-
-    if (!process.env.GEMINI_API_KEY) {
-      return res.json({
-        mode: "demo",
-        chunks: chunks.length,
-        summary: demoSummary(doc.text),
+    if (!process.env.GEMINI_API_KEY?.trim()) {
+      return res.status(400).json({
+        error: "Gemini API key is missing."
       });
     }
 
-    // If the whole PDF fits in one chunk, summarize it normally.
-    if (chunks.length === 1) {
-      try {
-        const result = await askGemini(
-          `Create a helpful study summary of the PDF text below.
-Include a short overview, main concepts, key definitions, and
-important takeaways. Do not invent facts. Use headings and
-concise bullets.
+    const chunks = chunkText(doc.text, 28000);
+    const partialSummaries = [];
 
-PDF TEXT:
-${chunks[0]}`
-        );
+    res.status(200);
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders();
 
-        return res.json({
-          mode: result ? "ai" : "demo",
-          summary: result || demoSummary(doc.text),
-          chunks: 1,
-          skippedChunks: [],
-        });
-      } catch (error) {
-        if (
-          /PROHIBITED_CONTENT|Finish reason: SAFETY/i.test(
-            error.message || ""
-          )
-        ) {
-          return res.status(422).json({
-            error:
-              "Gemini's safety filter blocked the full-PDF summary " +
-              "for this book. Paragraph summaries may still work. " +
-              "The app has not bypassed the filter.",
-          });
-        }
+    let disconnected = false;
 
-        throw error;
-      }
-    }
+    res.on("close", () => {
+      disconnected = true;
+    });
 
-    const partials = [];
-    const skippedChunks = [];
+    // STEP 1: Read the PDF in manageable chunks.
+    // These temporary summaries are never displayed to the user.
 
-    // Summarize each section independently.
-    for (let i = 0; i < chunks.length; i++) {
-      try {
-        const part = await askGemini(
-          `Summarize section ${i + 1} of ${chunks.length} of a
-student's PDF. Capture important facts, definitions, arguments,
-and examples. Do not invent details. Keep it concise.
+    for (let i = 0; i < chunks.length; i += 2) {
+      if (disconnected) return;
 
-SECTION:
-${chunks[i]}`
-        );
+      sendEvent("progress", {
+        message: `Understanding the document (${Math.min(i + 2, chunks.length)} of ${chunks.length})...`
+      });
 
-        partials.push({
-          section: i + 1,
-          summary: part,
-        });
-      } catch (error) {
-        if (
-          /PROHIBITED_CONTENT|Finish reason: SAFETY/i.test(
-            error.message || ""
-          )
-        ) {
-          skippedChunks.push(i + 1);
-          console.warn(
-            `Section ${i + 1} was blocked by Gemini's safety filter.`
+      const batch = chunks.slice(i, i + 2);
+
+      const results = await Promise.all(
+        batch.map(async (chunk, index) => {
+          const sectionNumber = i + index + 1;
+
+          return await askGemini(
+            `You are analyzing part ${sectionNumber} of a larger PDF.
+
+Extract only the most important information:
+- Central concepts and arguments
+- Essential definitions
+- Important examples or facts
+- Important conclusions
+
+Write a compact internal research note of approximately 100-150 words.
+Do not produce a chapter-wise study guide.
+Do not repeat information unnecessarily.
+Do not invent facts.
+
+DOCUMENT EXTRACT:
+${chunk}`,
+            { maxOutputTokens: 500 }
           );
-          continue;
-        }
+        })
+      );
 
-        throw error;
-      }
-    }
+      if (disconnected) return;
 
-    if (partials.length === 0) {
-      return res.status(422).json({
-        error:
-          "Gemini's safety filter blocked all sections of this book. " +
-          "The whole-PDF AI summary could not be generated.",
+      results.forEach((summary, index) => {
+        partialSummaries.push({
+          section: i + index + 1,
+          summary
+        });
       });
     }
 
-    const sectionText = partials
-      .map(
-        (item) =>
-          `SECTION ${item.section} SUMMARY:\n${item.summary}`
-      )
-      .join("\n\n---\n\n");
+    // STEP 2: Combine all internal notes into ONE concise summary.
 
-    let finalSummary;
+    if (disconnected) return;
 
-    try {
-      finalSummary = await askGemini(
-        `Combine the section summaries below into one coherent
-study guide. Remove repetition. Include an overview, topic-wise
-key points, definitions, and final takeaways. Do not add
-unsupported facts.
+    sendEvent("progress", {
+      message: "Preparing your final concise summary..."
+    });
 
-${skippedChunks.length
-  ? `Some sections were omitted because Gemini's safety filter blocked them: ${skippedChunks.join(", ")}. Do not claim that the summary covers those sections.`
-  : ""}
+    const internalNotes = partialSummaries
+      .map(item => item.summary)
+      .join("\n\n");
 
-SECTION SUMMARIES:
-${sectionText}`
-      );
-    } catch (error) {
-      if (
-        !/PROHIBITED_CONTENT|Finish reason: SAFETY/i.test(
-          error.message || ""
-        )
-      ) {
-        throw error;
+    const finalPrompt = `
+You are an expert academic summarizer.
+
+Create ONE cohesive, concise summary of the complete PDF
+using the internal notes below.
+
+IMPORTANT RULES:
+- Target approximately 400-600 words.
+- Do not create separate summaries for individual chunks.
+- Do not list all chapters or sections.
+- Remove repeated information.
+- Prioritize the central theme and most important concepts.
+- Use simple, student-friendly language.
+- Preserve important names, facts and terminology.
+- Do not invent information.
+
+Use this exact structure:
+
+## Overview
+Explain what the entire document is about in one short paragraph.
+
+## Main Ideas
+Present only 5-8 essential ideas as concise bullet points.
+
+## Important Definitions
+Include only essential terms, if applicable.
+
+## Key Takeaways
+Give the most important things a student should remember.
+
+## Conclusion
+Finish with a short paragraph explaining the overall message.
+
+INTERNAL NOTES FROM THE COMPLETE PDF:
+
+${internalNotes}
+`;
+
+    // STEP 3: Stream only the final summary to the frontend.
+
+    sendEvent("progress", {
+      message: "Writing your final summary..."
+    });
+
+    await streamGeminiText(
+      finalPrompt,
+      async (text) => {
+        if (!disconnected) {
+          sendEvent("delta", { text });
+        }
       }
+    );
 
-      // Keep the summaries already generated instead of failing
-      // the entire request if the final combining step is blocked.
-      finalSummary =
-        "Summary of the sections that could be processed:\n\n" +
-        partials
-          .map(
-            (item) =>
-              `Section ${item.section}\n${item.summary}`
-          )
-          .join("\n\n");
-    }
+    if (disconnected) return;
 
-    if (skippedChunks.length > 0) {
-      finalSummary +=
-        "\n\nNote: Sections " +
-        skippedChunks.join(", ") +
-        " were omitted because Gemini's safety filter blocked them. " +
-        "This is a partial summary, not a complete summary of the book.";
-    }
-
-    return res.json({
-      mode: "ai",
-      summary: finalSummary,
-      chunks: chunks.length,
-      skippedChunks,
+    sendEvent("done", {
+      mode: "ai"
     });
+
+    res.end();
+
   } catch (error) {
-    console.error("Whole-PDF summary failed:", error.message);
+    console.error("PDF summary failed:", error.message);
 
-    return res.status(502).json({
-      error: `AI request failed: ${error.message}`,
-    });
+    if (!res.headersSent) {
+      return res.status(502).json({
+        error: `AI request failed: ${error.message}`
+      });
+    }
+
+    if (!res.destroyed) {
+      sendEvent("error", {
+        message: error.message
+      });
+      res.end();
+    }
   }
 });
+
+
 
 
 app.post("/api/documents/:id/quiz", async (req, res) => {
