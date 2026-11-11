@@ -13,44 +13,6 @@ An independent starter project for an AI-powered PDF study assistant. It support
 - PDF extraction: `pdf-parse`
 - AI: Google Gemini API through a server-side REST call
 
-## Requirements
-- Node.js 18+
-- npm
-- A Gemini API key for real AI responses (the app still runs in demo mode without one)
-
-## 1. Start the backend
-Open a terminal in `backend/`:
-
-```bash
-npm install
-```
-
-Copy `.env.example` to `.env` and add your API key:
-
-```env
-GEMINI_API_KEY=your_api_key_here
-GEMINI_MODEL=gemini-2.5-flash
-PORT=5000
-```
-
-Then run:
-
-```bash
-npm run dev
-```
-
-Backend runs at `http://localhost:5000`.
-
-## 2. Start the frontend
-Open a second terminal in `frontend/`:
-
-```bash
-npm install
-npm run dev
-```
-
-Open the local URL Vite prints (usually `http://localhost:5173`).
-
 ## How to use
 1. Upload a text-based PDF.
 2. Wait for the text extraction to finish.
