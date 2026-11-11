@@ -46,6 +46,7 @@ Built using React, Node.js, Express, and Google Gemini AI, DocuMind AI transform
 ## 📸 Application Preview
 
 <img width="1792" height="817" alt="image" src="https://github.com/user-attachments/assets/1d568bf7-75f3-42c4-b1d9-296db3a7b923" />
+<img width="1355" height="896" alt="image" src="https://github.com/user-attachments/assets/c9824458-0e3b-41ea-a800-bb42de75f271" />
 
 
 <!-- Example:
